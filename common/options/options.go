@@ -103,11 +103,12 @@ type ToolOptions struct {
 type Namespace struct {
 	// Specified database and collection
 	DB         string `short:"d" long:"db" value-name:"<database-name>" description:"database to use"`
-	Collection string `short:"c" long:"collection" value-name:"<collection-name>" description:"collection to use"`
+	Collections []string `short:"c" long:"collection" value-name:"<collection-name>" description:"collection to use (can be set multiple times)"`
 }
 
 func (ns Namespace) String() string {
-	return ns.DB + "." + ns.Collection
+	// TODO make nicer
+	return ns.DB + "." + strings.Join(ns.Collections, " " + ns.DB + ".")
 }
 
 // Struct holding generic options

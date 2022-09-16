@@ -94,13 +94,13 @@ func newNotifier() *notifier { return &notifier{notified: make(chan struct{})} }
 // ValidateOptions checks for any incompatible sets of options.
 func (dump *MongoDump) ValidateOptions() error {
 	switch {
-	case dump.OutputOptions.Out == "-" && dump.ToolOptions.Namespace.Collection == "":
-		return fmt.Errorf("can only dump a single collection to stdout")
-	case dump.ToolOptions.Namespace.DB == "" && dump.ToolOptions.Namespace.Collection != "":
+	case dump.OutputOptions.Out == "-" && len(dump.ToolOptions.Namespace.Collections) == 0:
+		return fmt.Errorf("use --archive to dump more than one collection to stdout")
+	case dump.ToolOptions.Namespace.DB == "" && len(dump.ToolOptions.Namespace.Collections) > 0:
 		return fmt.Errorf("cannot dump a collection without a specified database")
-	case dump.InputOptions.Query != "" && dump.ToolOptions.Namespace.Collection == "":
+	case dump.InputOptions.Query != "" && len(dump.ToolOptions.Namespace.Collections) == 0:
 		return fmt.Errorf("cannot dump using a query without a specified collection")
-	case dump.InputOptions.QueryFile != "" && dump.ToolOptions.Namespace.Collection == "":
+	case dump.InputOptions.QueryFile != "" && len(dump.ToolOptions.Namespace.Collections) == 0:
 		return fmt.Errorf("cannot dump using a queryFile without a specified collection")
 	case dump.InputOptions.Query != "" && dump.InputOptions.QueryFile != "":
 		return fmt.Errorf("either query or queryFile can be specified as a query option, not both")
@@ -108,16 +108,13 @@ func (dump *MongoDump) ValidateOptions() error {
 		return fmt.Errorf("cannot use --forceTableScan when specifying --query")
 	case dump.OutputOptions.DumpDBUsersAndRoles && dump.ToolOptions.Namespace.DB == "":
 		return fmt.Errorf("must specify a database when running with dumpDbUsersAndRoles")
-	case dump.OutputOptions.DumpDBUsersAndRoles && dump.ToolOptions.Namespace.Collection != "":
+	case dump.OutputOptions.DumpDBUsersAndRoles && len(dump.ToolOptions.Namespace.Collections) > 0:
 		return fmt.Errorf("cannot specify a collection when running with dumpDbUsersAndRoles")
-	case strings.HasPrefix(dump.ToolOptions.Namespace.Collection, "system.buckets."):
-		return fmt.Errorf("cannot specify a system.buckets collection in --collection. " +
-			"Specifying the timeseries collection will dump the system.buckets collection")
 	case dump.OutputOptions.Oplog && dump.ToolOptions.Namespace.DB != "":
 		return fmt.Errorf("--oplog mode only supported on full dumps")
-	case len(dump.OutputOptions.ExcludedCollections) > 0 && dump.ToolOptions.Namespace.Collection != "":
+	case len(dump.OutputOptions.ExcludedCollections) > 0 && len(dump.ToolOptions.Namespace.Collections) > 0:
 		return fmt.Errorf("--collection is not allowed when --excludeCollection is specified")
-	case len(dump.OutputOptions.ExcludedCollectionPrefixes) > 0 && dump.ToolOptions.Namespace.Collection != "":
+	case len(dump.OutputOptions.ExcludedCollectionPrefixes) > 0 && len(dump.ToolOptions.Namespace.Collections) > 0:
 		return fmt.Errorf("--collection is not allowed when --excludeCollectionsWithPrefix is specified")
 	case len(dump.OutputOptions.ExcludedCollections) > 0 && dump.ToolOptions.Namespace.DB == "":
 		return fmt.Errorf("--db is required when --excludeCollection is specified")
@@ -129,6 +126,13 @@ func (dump *MongoDump) ValidateOptions() error {
 		return fmt.Errorf("compression can't be used when dumping a single collection to standard output")
 	case dump.OutputOptions.NumParallelCollections <= 0:
 		return fmt.Errorf("numParallelCollections must be positive")
+	case len(dump.ToolOptions.Namespace.Collections) > 0:
+		for _, coll := range dump.ToolOptions.Namespace.Collections {
+			if strings.HasPrefix(coll, "system.buckets.") {
+				return fmt.Errorf("cannot specify a system.buckets collection in --collection. " +
+					"Specifying the timeseries collection will dump the system.buckets collection")
+			}
+		}
 	}
 	return nil
 }
@@ -179,14 +183,8 @@ func (dump *MongoDump) Init() error {
 	return nil
 }
 
-func (dump *MongoDump) verifyCollectionExists() (bool, error) {
-	// Running MongoDump against a DB with no collection specified works. In this case, return true so the process
-	// can continue.
-	if dump.ToolOptions.Namespace.Collection == "" {
-		return true, nil
-	}
-
-	coll := dump.SessionProvider.DB(dump.ToolOptions.Namespace.DB).Collection(dump.ToolOptions.Namespace.Collection)
+func (dump *MongoDump) verifyCollectionExists(collection string) (bool, error) {
+	coll := dump.SessionProvider.DB(dump.ToolOptions.Namespace.DB).Collection(collection)
 	collInfo, err := db.GetCollectionInfo(coll)
 	if err != nil {
 		return false, err
@@ -199,14 +197,18 @@ func (dump *MongoDump) verifyCollectionExists() (bool, error) {
 func (dump *MongoDump) Dump() (err error) {
 	defer dump.SessionProvider.Close()
 
-	exists, err := dump.verifyCollectionExists()
-	if err != nil {
-		return fmt.Errorf("error verifying collection info: %v", err)
-	}
-	if !exists {
-		log.Logvf(log.Always, "namespace with DB %s and collection %s does not exist",
-			dump.ToolOptions.Namespace.DB, dump.ToolOptions.Namespace.Collection)
-		return nil
+	// Running MongoDump against a DB with no collection specified works. In this case, return true so the process
+	// can continue.
+	for _, coll := range dump.ToolOptions.Namespace.Collections {
+		exists, err := dump.verifyCollectionExists(coll)
+		if err != nil {
+			return fmt.Errorf("error verifying info for %s: %v", coll, err)
+		}
+		if !exists {
+			log.Logvf(log.Always, "namespace with DB %s and collection %s does not exist",
+				dump.ToolOptions.Namespace.DB, coll)
+			return nil
+		}
 	}
 
 	log.Logvf(log.DebugHigh, "starting Dump()")
@@ -286,12 +288,17 @@ func (dump *MongoDump) Dump() (err error) {
 
 	// switch on what kind of execution to do
 	switch {
-	case dump.ToolOptions.DB == "" && dump.ToolOptions.Collection == "":
+	case dump.ToolOptions.DB == "" && len(dump.ToolOptions.Collections) == 0:
 		err = dump.CreateAllIntents()
-	case dump.ToolOptions.DB != "" && dump.ToolOptions.Collection == "":
+	case dump.ToolOptions.DB != "" && len(dump.ToolOptions.Collections) == 0:
 		err = dump.CreateIntentsForDatabase(dump.ToolOptions.DB)
-	case dump.ToolOptions.DB != "" && dump.ToolOptions.Collection != "":
-		err = dump.CreateCollectionIntent(dump.ToolOptions.DB, dump.ToolOptions.Collection)
+	case dump.ToolOptions.DB != "" && len(dump.ToolOptions.Collections) > 0:
+		for _, coll := range dump.ToolOptions.Namespace.Collections {
+			err = dump.CreateCollectionIntent(dump.ToolOptions.DB, coll)
+			if err != nil {
+				break
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("error creating intents to dump: %v", err)
